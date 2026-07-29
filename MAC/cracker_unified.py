@@ -104,9 +104,23 @@ class PasswordCrackerGUI:
         self.restart_button = tk.Button(self.button_frame, text="Restart", command=self.restart_cracking, state=tk.DISABLED)
         self.restart_button.grid(row=0, column=3, padx=5)
 
-        # ---- Status labels ----
-        self.current_guess_label = tk.Label(root, text="Current guess: None", font=("Arial", 12))
-        self.current_guess_label.pack(pady=5)
+        # ---- Status boxes ----
+        tk.Label(root, text="Password being searched for:", font=("Arial", 11)).pack(pady=(5, 0))
+        self.target_password_var = tk.StringVar(value="")
+        self.target_password_box = tk.Entry(
+            root, textvariable=self.target_password_var, width=25,
+            justify="center", font=("Arial", 12), state="readonly"
+        )
+        self.target_password_box.pack(pady=(0, 5))
+
+        tk.Label(root, text="Currently testing:", font=("Arial", 11)).pack(pady=(5, 0))
+        self.current_guess_var = tk.StringVar(value="None")
+        self.current_guess_box = tk.Entry(
+            root, textvariable=self.current_guess_var, width=25,
+            justify="center", font=("Arial", 12), state="readonly"
+        )
+        self.current_guess_box.pack(pady=(0, 5))
+
         self.attempts_label = tk.Label(root, text="Attempts: 0", font=("Arial", 12))
         self.attempts_label.pack(pady=5)
         self.time_label = tk.Label(root, text="Time: 0.0000 seconds", font=("Arial", 12))
@@ -212,6 +226,8 @@ class PasswordCrackerGUI:
         self.stop_event.clear()
         self.pause_event.clear()
 
+        self.target_password_var.set(password)
+
         self.output_box.delete("1.0", tk.END)
         self.output_box.insert(tk.END, "Starting cracker in worker threads...\n")
 
@@ -297,7 +313,7 @@ class PasswordCrackerGUI:
                     guess = message["guess"]
                     attempts = message["attempts"]
                     elapsed_time = message["time"]
-                    self.current_guess_label.config(text=f"Current guess: {guess}")
+                    self.current_guess_var.set(guess)
                     self.attempts_label.config(text=f"Attempts: {attempts}")
                     self.time_label.config(text=f"Time: {elapsed_time:.4f} seconds")
                     self.output_box.insert(
@@ -315,7 +331,7 @@ class PasswordCrackerGUI:
                     attempts = message["attempts"]
                     elapsed_time = message["time"]
                     thread_id = message["thread_id"]
-                    self.current_guess_label.config(text=f"Current guess: {guess}")
+                    self.current_guess_var.set(guess)
                     self.attempts_label.config(text=f"Attempts: {attempts}")
                     self.time_label.config(text=f"Time: {elapsed_time:.4f} seconds")
                     self.output_box.insert(tk.END, "\nPassword cracked!\n")
@@ -383,7 +399,8 @@ class PasswordCrackerGUI:
             except queue.Empty:
                 break
 
-        self.current_guess_label.config(text="Current guess: None")
+        self.target_password_var.set("")
+        self.current_guess_var.set("None")
         self.attempts_label.config(text="Attempts: 0")
         self.time_label.config(text="Time: 0.0000 seconds")
         self.uart_status_label.config(text="Basys3 UART: idle", fg="gray30")
