@@ -56,8 +56,18 @@ def crack_worker_process(thread_id, starting_chars, characters, length,
         local_attempts = 0
         last_update_time = time.time()
 
-        for first_char in starting_chars:
-            for rest_tuple in itertools.product(characters, repeat=length - 1):
+        # Loop order matters here: iterating the *remaining* digits on the
+        # outside and this worker's assigned first-digits on the inside
+        # means every first-digit this worker owns gets tried within a
+        # handful of attempts of each other, instead of fully exhausting
+        # one first-digit (10^(length-1) combinations) before ever moving
+        # to the next. With the old nesting, a worker assigned first
+        # digits {6,7,8,9} could take minutes just to leave "6" — which is
+        # exactly why only the very first digit of each worker's chunk
+        # (0, 2, 4, 6 for 4 workers) was ever visible in a normal demo run.
+        for rest_tuple in itertools.product(characters, repeat=length - 1):
+            rest = "".join(rest_tuple)
+            for first_char in starting_chars:
                 if stop_event.is_set():
                     return
 
@@ -66,7 +76,7 @@ def crack_worker_process(thread_id, starting_chars, characters, length,
                         return
                     time.sleep(0.05)
 
-                guess = first_char + "".join(rest_tuple)
+                guess = first_char + rest
                 local_attempts += 1
 
                 now = time.time()
@@ -202,6 +212,21 @@ class PasswordCrackerGUI:
         if not HAVE_PYSERIAL:
             self.uart_status_label.config(
                 text="Basys3 UART: pyserial not installed (pip install pyserial)", fg="red"
+            )
+
+        # Tk 8.5 (still the default on some macOS Python installs) has a
+        # documented rendering bug where widgets accept clicks at the right
+        # coordinates but fail to actually paint. If we're on it, flag it
+        # loudly instead of leaving it to look like a code bug.
+        if tk.TkVersion < 8.6:
+            self.root.title(
+                f"CPU + Basys3 Password Cracker Demo  —  WARNING: Tk {tk.TkVersion} detected, "
+                f"upgrade Python (python.org) for correct rendering"
+            )
+            self.output_box.insert(
+                tk.END,
+                f"WARNING: Tk version {tk.TkVersion} detected. Tk 8.5 has known rendering bugs "
+                "(invisible widgets). Install Python from python.org for Tk 8.6+.\n\n"
             )
 
         self.update_password_label()
