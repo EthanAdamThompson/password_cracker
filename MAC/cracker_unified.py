@@ -40,10 +40,8 @@ UART_INTER_BYTE_DELAY = 0.01
 # ------------------------------------------------------------------
 # Cracker config
 # ------------------------------------------------------------------
-CHAR_SETS = {
-    "alnum": string.digits + string.ascii_lowercase,
-    "digits": string.digits,
-}
+# Numbers-only mode (ASCII/alnum mode removed per request).
+CHARACTERS = string.digits
 UPDATE_INTERVAL = 0.1
 MAX_OUTPUT_LINES = 200
 NUM_THREADS = 4
@@ -53,7 +51,7 @@ class PasswordCrackerGUI:
     def __init__(self, root):
         self.root = root
         self.root.title("CPU + Basys3 Password Cracker Demo")
-        self.root.geometry("600x560")
+        self.root.geometry("600x540")
 
         self.target_password = ""
         self.attempts = 0
@@ -75,24 +73,10 @@ class PasswordCrackerGUI:
         )
         self.title_label.pack(pady=10)
 
-        # ---- Mode selection ----
-        self.mode_frame = tk.Frame(root)
-        self.mode_frame.pack(pady=2)
-        self.mode_var = tk.StringVar(value="alnum")
-        tk.Label(self.mode_frame, text="Character set:").grid(row=0, column=0, padx=5)
-        tk.Radiobutton(
-            self.mode_frame, text="Letters + numbers", variable=self.mode_var,
-            value="alnum", command=self.update_password_label
-        ).grid(row=0, column=1, padx=5)
-        tk.Radiobutton(
-            self.mode_frame, text="Numbers only", variable=self.mode_var,
-            value="digits", command=self.update_password_label
-        ).grid(row=0, column=2, padx=5)
-
         # ---- Length selection ----
         self.length_frame = tk.Frame(root)
         self.length_frame.pack(pady=2)
-        tk.Label(self.length_frame, text="Password length:").grid(row=0, column=0, padx=5)
+        tk.Label(self.length_frame, text="Password length (numbers only):").grid(row=0, column=0, padx=5)
         self.length_var = tk.IntVar(value=6)
         self.length_spinbox = tk.Spinbox(
             self.length_frame, from_=1, to=10, width=5,
@@ -101,9 +85,11 @@ class PasswordCrackerGUI:
         self.length_spinbox.grid(row=0, column=1, padx=5)
 
         # ---- Password entry ----
-        self.password_label = tk.Label(root, text="Set 6-character password (letters and/or numbers)")
+        # show="" (i.e. not set) means the typed password is visible in
+        # plain text, not masked with asterisks.
+        self.password_label = tk.Label(root, text="Set 6-digit password (numbers only)")
         self.password_label.pack(pady=(8, 0))
-        self.password_entry = tk.Entry(root, width=25, show="*")
+        self.password_entry = tk.Entry(root, width=25)
         self.password_entry.pack(pady=5)
 
         # ---- Buttons ----
@@ -144,12 +130,11 @@ class PasswordCrackerGUI:
     # UI helpers
     # ------------------------------------------------------------
     def update_password_label(self):
-        mode_text = "letters and/or numbers" if self.mode_var.get() == "alnum" else "numbers only"
         length = self.length_var.get()
-        self.password_label.config(text=f"Set {length}-character password ({mode_text})")
+        self.password_label.config(text=f"Set {length}-digit password (numbers only)")
 
     def get_characters(self):
-        return CHAR_SETS[self.mode_var.get()]
+        return CHARACTERS
 
     def split_characters_evenly(self, chars, num_threads):
         chunk_size = len(chars) // num_threads
@@ -161,13 +146,12 @@ class PasswordCrackerGUI:
         return chunks
 
     def validate_password(self, password):
-        password = password.lower()
         length = self.length_var.get()
         if len(password) != length:
-            return None, f"Password must be exactly {length} characters long."
+            return None, f"Password must be exactly {length} digits long."
         allowed = self.get_characters()
         if not all(ch in allowed for ch in password):
-            return None, "Password contains characters not allowed for the selected character set."
+            return None, "Password must contain digits only (0-9)."
         return password, None
 
     # ------------------------------------------------------------
