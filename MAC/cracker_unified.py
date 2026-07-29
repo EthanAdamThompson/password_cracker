@@ -2,6 +2,7 @@ import itertools
 import string
 import time
 import threading
+import multiprocessing
 import queue
 import tkinter as tk
 from tkinter import messagebox
@@ -23,49 +24,101 @@ except ImportError:
 SERIAL_PORT = "/dev/cu.usbserial-XXXX"
 
 # Matches the BAUD_RATE parameter in rx.sv (default 19_200).
-# If your instantiation overrides BAUD_RATE, change this to match.
 BAUD_RATE = 19200
-
-# rx.sv samples a standard 10-bit frame: 1 start + 8 data + 1 stop.
-# That's just 8-N-1, so no special parity handling is needed here.
 UART_BYTESIZE = 8
 UART_PARITY = 'N'
 UART_STOPBITS = 1
-
-# Small delay between bytes so the FPGA has time to latch/ack each
-# character before the next one arrives. Shrink this if your top-level
-# logic acks fast enough; grow it if characters seem to get dropped.
 UART_INTER_BYTE_DELAY = 0.01
 
 # ------------------------------------------------------------------
 # Cracker config
 # ------------------------------------------------------------------
-# Numbers-only mode (ASCII/alnum mode removed per request).
 CHARACTERS = string.digits
 UPDATE_INTERVAL = 0.1
 MAX_OUTPUT_LINES = 200
-NUM_THREADS = 4
+NUM_WORKERS = 4
+
+
+# ------------------------------------------------------------------
+# Worker function — MUST be a plain module-level function, not a class
+# method. macOS uses the "spawn" start method for multiprocessing, which
+# pickles the target function + args to send to the child process. A
+# bound method carrying a reference to `self` (and therefore the Tkinter
+# root/widgets) is not picklable and will crash or silently misbehave.
+# ------------------------------------------------------------------
+def crack_worker_process(thread_id, starting_chars, characters, length,
+                          target_password, message_queue, stop_event,
+                          pause_event, update_interval):
+    local_attempts = 0
+    last_update_time = time.time()
+
+    for first_char in starting_chars:
+        for rest_tuple in itertools.product(characters, repeat=length - 1):
+            if stop_event.is_set():
+                return
+
+            while pause_event.is_set():
+                if stop_event.is_set():
+                    return
+                time.sleep(0.05)
+
+            guess = first_char + "".join(rest_tuple)
+            local_attempts += 1
+
+            now = time.time()
+            if now - last_update_time >= update_interval:
+                message_queue.put({
+                    "type": "update",
+                    "thread_id": thread_id,
+                    "guess": guess,
+                    "attempts": local_attempts,
+                })
+                last_update_time = now
+
+            if guess == target_password:
+                stop_event.set()
+                message_queue.put({
+                    "type": "found",
+                    "thread_id": thread_id,
+                    "guess": guess,
+                    "attempts": local_attempts,
+                })
+                return
+
+    # This worker exhausted its share of the keyspace without a match
+    # (expected for every worker except the one that finds it).
+    message_queue.put({
+        "type": "worker_done",
+        "thread_id": thread_id,
+        "attempts": local_attempts,
+    })
 
 
 class PasswordCrackerGUI:
     def __init__(self, root):
         self.root = root
         self.root.title("CPU + Basys3 Password Cracker Demo")
-        self.root.geometry("600x540")
+        # Tall enough to fit every widget without clipping. minsize stops
+        # the user from accidentally shrinking it below that point.
+        self.root.geometry("640x760")
+        self.root.minsize(640, 760)
 
         self.target_password = ""
-        self.attempts = 0
         self.start_time = None
         self.paused_time = 0
         self.pause_start = None
         self.running = False
         self.paused = False
 
-        self.worker_threads = []
-        self.attempts_lock = threading.Lock()
-        self.message_queue = queue.Queue()
-        self.stop_event = threading.Event()
-        self.pause_event = threading.Event()
+        self.worker_processes = []
+        # Latest attempts count reported by each worker, keyed by thread_id.
+        # Summed for the on-screen total. Only ever touched from the main
+        # thread (inside check_queue), so no lock is needed.
+        self.thread_attempts = {}
+
+        self.message_queue = multiprocessing.Queue()
+        self.stop_event = multiprocessing.Event()
+        self.pause_event = multiprocessing.Event()
 
         # ---- Title ----
         self.title_label = tk.Label(
@@ -85,8 +138,6 @@ class PasswordCrackerGUI:
         self.length_spinbox.grid(row=0, column=1, padx=5)
 
         # ---- Password entry ----
-        # show="" (i.e. not set) means the typed password is visible in
-        # plain text, not masked with asterisks.
         self.password_label = tk.Label(root, text="Set 8-digit password (numbers only)")
         self.password_label.pack(pady=(8, 0))
         self.password_entry = tk.Entry(root, width=25)
@@ -130,7 +181,7 @@ class PasswordCrackerGUI:
 
         # ---- Output box ----
         self.output_box = tk.Text(root, height=10, width=64)
-        self.output_box.pack(pady=10)
+        self.output_box.pack(pady=10, fill=tk.BOTH, expand=True)
 
         if not HAVE_PYSERIAL:
             self.uart_status_label.config(
@@ -150,12 +201,12 @@ class PasswordCrackerGUI:
     def get_characters(self):
         return CHARACTERS
 
-    def split_characters_evenly(self, chars, num_threads):
-        chunk_size = len(chars) // num_threads
+    def split_characters_evenly(self, chars, num_workers):
+        chunk_size = len(chars) // num_workers
         chunks = []
-        for i in range(num_threads):
+        for i in range(num_workers):
             start = i * chunk_size
-            end = len(chars) if i == num_threads - 1 else (i + 1) * chunk_size
+            end = len(chars) if i == num_workers - 1 else (i + 1) * chunk_size
             chunks.append(chars[start:end])
         return chunks
 
@@ -169,12 +220,10 @@ class PasswordCrackerGUI:
         return password, None
 
     # ------------------------------------------------------------
-    # UART
+    # UART (stays on a thread, not a process — it's I/O bound, needs to
+    # touch self.message_queue, and doesn't need a separate CPU core)
     # ------------------------------------------------------------
     def send_to_basys3(self, password):
-        """Runs in its own thread. Sends the password to the Basys3 over UART
-        so the FPGA starts cracking at (as close to) the same moment as the
-        CPU threads."""
         if not HAVE_PYSERIAL:
             self.message_queue.put({
                 "type": "uart_status",
@@ -217,19 +266,19 @@ class PasswordCrackerGUI:
             return
 
         self.target_password = password
-        self.attempts = 0
         self.start_time = time.time()
         self.paused_time = 0
         self.pause_start = None
         self.running = True
         self.paused = False
+        self.thread_attempts = {}
         self.stop_event.clear()
         self.pause_event.clear()
 
         self.target_password_var.set(password)
 
         self.output_box.delete("1.0", tk.END)
-        self.output_box.insert(tk.END, "Starting cracker in worker threads...\n")
+        self.output_box.insert(tk.END, "Starting cracker in worker processes...\n")
 
         self.start_button.config(state=tk.DISABLED)
         self.pause_button.config(state=tk.NORMAL)
@@ -238,68 +287,28 @@ class PasswordCrackerGUI:
         self.password_entry.config(state=tk.DISABLED)
         self.length_spinbox.config(state=tk.DISABLED)
 
-        # Kick off the UART send to the Basys3 at the same moment as the
-        # CPU worker threads, so both start cracking together.
         self.uart_status_label.config(text="Basys3 UART: sending...", fg="gray30")
         uart_thread = threading.Thread(target=self.send_to_basys3, args=(password,), daemon=True)
         uart_thread.start()
 
-        self.worker_threads = []
+        self.worker_processes = []
         characters = self.get_characters()
-        chunks = self.split_characters_evenly(characters, NUM_THREADS)
+        length = self.length_var.get()
+        chunks = self.split_characters_evenly(characters, NUM_WORKERS)
         for thread_id, starting_chars in enumerate(chunks, start=1):
             if not starting_chars:
                 continue
-            thread = threading.Thread(
-                target=self.crack_worker,
-                args=(thread_id, starting_chars, characters),
+            process = multiprocessing.Process(
+                target=crack_worker_process,
+                args=(thread_id, starting_chars, characters, length,
+                      self.target_password, self.message_queue,
+                      self.stop_event, self.pause_event, UPDATE_INTERVAL),
                 daemon=True,
             )
-            self.worker_threads.append(thread)
-            thread.start()
+            self.worker_processes.append(process)
+            process.start()
 
-        self.output_box.insert(tk.END, f"Started {len(self.worker_threads)} CPU worker threads.\n")
-
-    def crack_worker(self, thread_id, starting_chars, characters):
-        length = self.length_var.get()
-        last_update_time = time.time()
-        for first_char in starting_chars:
-            for rest_tuple in itertools.product(characters, repeat=length - 1):
-                if self.stop_event.is_set():
-                    return
-                while self.pause_event.is_set():
-                    if self.stop_event.is_set():
-                        return
-                    time.sleep(0.05)
-
-                guess = first_char + "".join(rest_tuple)
-
-                with self.attempts_lock:
-                    self.attempts += 1
-                    attempts_snapshot = self.attempts
-
-                current_time = time.time()
-                elapsed_time = self.get_elapsed_time()
-                if current_time - last_update_time >= UPDATE_INTERVAL:
-                    self.message_queue.put({
-                        "type": "update",
-                        "thread_id": thread_id,
-                        "guess": guess,
-                        "attempts": attempts_snapshot,
-                        "time": elapsed_time,
-                    })
-                    last_update_time = current_time
-
-                if guess == self.target_password:
-                    self.stop_event.set()
-                    self.message_queue.put({
-                        "type": "found",
-                        "thread_id": thread_id,
-                        "guess": guess,
-                        "attempts": attempts_snapshot,
-                        "time": elapsed_time,
-                    })
-                    return
+        self.output_box.insert(tk.END, f"Started {len(self.worker_processes)} CPU worker processes (real multi-core).\n")
 
     def check_queue(self):
         max_messages_per_check = 20
@@ -311,13 +320,14 @@ class PasswordCrackerGUI:
 
                 if message["type"] == "update":
                     guess = message["guess"]
-                    attempts = message["attempts"]
-                    elapsed_time = message["time"]
+                    self.thread_attempts[message["thread_id"]] = message["attempts"]
+                    total_attempts = sum(self.thread_attempts.values())
+                    elapsed_time = self.get_elapsed_time()
                     self.current_guess_var.set(guess)
-                    self.attempts_label.config(text=f"Attempts: {attempts}")
+                    self.attempts_label.config(text=f"Attempts: {total_attempts}")
                     self.time_label.config(text=f"Time: {elapsed_time:.4f} seconds")
                     self.output_box.insert(
-                        tk.END, f"Thread {message['thread_id']}: Trying {guess}    Attempts: {attempts}\n"
+                        tk.END, f"Thread {message['thread_id']}: Trying {guess}    Attempts: {total_attempts}\n"
                     )
                     line_count = int(self.output_box.index("end-1c").split(".")[0])
                     if line_count > MAX_OUTPUT_LINES:
@@ -328,16 +338,17 @@ class PasswordCrackerGUI:
                     self.running = False
                     self.paused = False
                     guess = message["guess"]
-                    attempts = message["attempts"]
-                    elapsed_time = message["time"]
                     thread_id = message["thread_id"]
+                    self.thread_attempts[thread_id] = message["attempts"]
+                    total_attempts = sum(self.thread_attempts.values())
+                    elapsed_time = self.get_elapsed_time()
                     self.current_guess_var.set(guess)
-                    self.attempts_label.config(text=f"Attempts: {attempts}")
+                    self.attempts_label.config(text=f"Attempts: {total_attempts}")
                     self.time_label.config(text=f"Time: {elapsed_time:.4f} seconds")
                     self.output_box.insert(tk.END, "\nPassword cracked!\n")
-                    self.output_box.insert(tk.END, f"Found by thread: {thread_id}\n")
+                    self.output_box.insert(tk.END, f"Found by worker: {thread_id}\n")
                     self.output_box.insert(tk.END, f"Correct password: {guess}\n")
-                    self.output_box.insert(tk.END, f"Total attempts: {attempts}\n")
+                    self.output_box.insert(tk.END, f"Total attempts: {total_attempts}\n")
                     self.output_box.insert(tk.END, f"Time taken: {elapsed_time:.4f} seconds\n")
                     self.pause_button.config(state=tk.DISABLED)
                     self.resume_button.config(state=tk.DISABLED)
@@ -345,10 +356,13 @@ class PasswordCrackerGUI:
                     messagebox.showinfo(
                         "Password Cracked!",
                         f"Correct password: {guess}\n"
-                        f"Found by thread: {thread_id}\n"
-                        f"Total attempts: {attempts}\n"
+                        f"Found by worker: {thread_id}\n"
+                        f"Total attempts: {total_attempts}\n"
                         f"Time taken: {elapsed_time:.4f} seconds",
                     )
+
+                elif message["type"] == "worker_done":
+                    self.thread_attempts[message["thread_id"]] = message["attempts"]
 
                 elif message["type"] == "uart_status":
                     color = "red" if message.get("error") else "green"
@@ -388,10 +402,10 @@ class PasswordCrackerGUI:
         self.running = False
         self.paused = False
         self.target_password = ""
-        self.attempts = 0
         self.start_time = None
         self.paused_time = 0
         self.pause_start = None
+        self.thread_attempts = {}
 
         while not self.message_queue.empty():
             try:
