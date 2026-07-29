@@ -16,12 +16,13 @@ except ImportError:
 # ------------------------------------------------------------------
 # UART CONFIG
 # ------------------------------------------------------------------
-# TODO: update SERIAL_PORT to match your Mac's device for the Basys3.
-# With the board plugged in, run in Terminal:
-#   ls /dev/cu.*
-# and pick the one that appears/disappears when you plug/unplug the board
-# (often something like /dev/cu.usbserial-XXXXXXXX).
-SERIAL_PORT = "/dev/cu.usbserial-XXXX"
+# Leave this as "AUTO" to auto-detect the Basys3's serial port at
+# connect time (works on both macOS and Linux). Set it to an explicit
+# path only if auto-detection picks the wrong device (e.g. you have
+# multiple USB-serial adapters plugged in at once):
+#   macOS:  ls /dev/cu.*        -> e.g. /dev/cu.usbserial-XXXXXXXX
+#   Linux:  ls /dev/ttyUSB* /dev/ttyACM*  -> e.g. /dev/ttyUSB0
+SERIAL_PORT = "AUTO"
 
 # Matches the BAUD_RATE parameter in rx.sv (default 19_200).
 BAUD_RATE = 19200
@@ -29,6 +30,27 @@ UART_BYTESIZE = 8
 UART_PARITY = 'N'
 UART_STOPBITS = 1
 UART_INTER_BYTE_DELAY = 0.01
+
+
+def find_serial_port():
+    """Scan available serial ports and guess which one is the Basys3.
+    Works on both macOS (cu.usbserial-*) and Linux (ttyUSB*/ttyACM*)."""
+    if not HAVE_PYSERIAL:
+        return None
+    from serial.tools import list_ports
+    ports = list(list_ports.comports())
+    if not ports:
+        return None
+    # Prefer ports that look like a USB-UART bridge (FTDI/CP210x/etc),
+    # which is what the Basys3's onboard programmer/UART shows up as.
+    preferred_tags = ("usbserial", "ttyusb", "ttyacm", "usbmodem", "cp210", "ftdi")
+    for p in ports:
+        device_lower = p.device.lower()
+        desc_lower = (p.description or "").lower()
+        if any(tag in device_lower or tag in desc_lower for tag in preferred_tags):
+            return p.device
+    # Fall back to the first port found if nothing matched a known pattern.
+    return ports[0].device
 
 # ------------------------------------------------------------------
 # Cracker config
@@ -276,9 +298,21 @@ class PasswordCrackerGUI:
                 "error": True,
             })
             return
+
+        port = SERIAL_PORT
+        if port == "AUTO":
+            port = find_serial_port()
+            if port is None:
+                self.message_queue.put({
+                    "type": "uart_status",
+                    "text": "Basys3 UART: no serial port found (board plugged in?)",
+                    "error": True,
+                })
+                return
+
         try:
             with serial.Serial(
-                SERIAL_PORT,
+                port,
                 BAUD_RATE,
                 bytesize=UART_BYTESIZE,
                 parity=UART_PARITY,
@@ -288,15 +322,20 @@ class PasswordCrackerGUI:
                 for ch in password:
                     ser.write(ch.encode("ascii"))
                     time.sleep(UART_INTER_BYTE_DELAY)
+                # password_crack.sv only locks the length and starts cracking
+                # once it sees a CR (0x0D) or LF (0x0A) after the digits — send
+                # one explicitly, since the digits alone never trigger it.
+                ser.write(b"\r")
+                time.sleep(UART_INTER_BYTE_DELAY)
             self.message_queue.put({
                 "type": "uart_status",
-                "text": "Basys3 UART: password sent",
+                "text": f"Basys3 UART: password + start sent via {port}",
                 "error": False,
             })
         except serial.SerialException as e:
             self.message_queue.put({
                 "type": "uart_status",
-                "text": f"Basys3 UART error: {e}",
+                "text": f"Basys3 UART error on {port}: {e}",
                 "error": True,
             })
 
