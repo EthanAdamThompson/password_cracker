@@ -49,59 +49,71 @@ NUM_WORKERS = 4
 def crack_worker_process(thread_id, starting_chars, characters, length,
                           target_password, message_queue, stop_event,
                           pause_event, update_interval):
-    local_attempts = 0
-    last_update_time = time.time()
+    # Everything is wrapped in try/except so a crash in this worker shows
+    # up as a message in the GUI instead of silently dying with no output
+    # (which is what a bare crash looks like from the main process's side).
+    try:
+        local_attempts = 0
+        last_update_time = time.time()
 
-    for first_char in starting_chars:
-        for rest_tuple in itertools.product(characters, repeat=length - 1):
-            if stop_event.is_set():
-                return
-
-            while pause_event.is_set():
+        for first_char in starting_chars:
+            for rest_tuple in itertools.product(characters, repeat=length - 1):
                 if stop_event.is_set():
                     return
-                time.sleep(0.05)
 
-            guess = first_char + "".join(rest_tuple)
-            local_attempts += 1
+                while pause_event.is_set():
+                    if stop_event.is_set():
+                        return
+                    time.sleep(0.05)
 
-            now = time.time()
-            if now - last_update_time >= update_interval:
-                message_queue.put({
-                    "type": "update",
-                    "thread_id": thread_id,
-                    "guess": guess,
-                    "attempts": local_attempts,
-                })
-                last_update_time = now
+                guess = first_char + "".join(rest_tuple)
+                local_attempts += 1
 
-            if guess == target_password:
-                stop_event.set()
-                message_queue.put({
-                    "type": "found",
-                    "thread_id": thread_id,
-                    "guess": guess,
-                    "attempts": local_attempts,
-                })
-                return
+                now = time.time()
+                if now - last_update_time >= update_interval:
+                    message_queue.put({
+                        "type": "update",
+                        "thread_id": thread_id,
+                        "guess": guess,
+                        "attempts": local_attempts,
+                    })
+                    last_update_time = now
 
-    # This worker exhausted its share of the keyspace without a match
-    # (expected for every worker except the one that finds it).
-    message_queue.put({
-        "type": "worker_done",
-        "thread_id": thread_id,
-        "attempts": local_attempts,
-    })
+                if guess == target_password:
+                    stop_event.set()
+                    message_queue.put({
+                        "type": "found",
+                        "thread_id": thread_id,
+                        "guess": guess,
+                        "attempts": local_attempts,
+                    })
+                    return
+
+        # This worker exhausted its share of the keyspace without a match
+        # (expected for every worker except the one that finds it).
+        message_queue.put({
+            "type": "worker_done",
+            "thread_id": thread_id,
+            "attempts": local_attempts,
+        })
+    except Exception as e:
+        import traceback
+        message_queue.put({
+            "type": "error",
+            "thread_id": thread_id,
+            "error": f"{e}\n{traceback.format_exc()}",
+        })
 
 
 class PasswordCrackerGUI:
     def __init__(self, root):
         self.root = root
         self.root.title("CPU + Basys3 Password Cracker Demo")
-        # Tall enough to fit every widget without clipping. minsize stops
-        # the user from accidentally shrinking it below that point.
-        self.root.geometry("640x760")
-        self.root.minsize(640, 760)
+        # Launch fullscreen for the demo. Escape exits fullscreen (in case
+        # you need to get back to the desktop mid-demo without losing state).
+        self.is_fullscreen = True
+        self.root.attributes("-fullscreen", True)
+        self.root.bind("<Escape>", self.toggle_fullscreen)
 
         self.target_password = ""
         self.start_time = None
@@ -160,7 +172,9 @@ class PasswordCrackerGUI:
         self.target_password_var = tk.StringVar(value="")
         self.target_password_box = tk.Entry(
             root, textvariable=self.target_password_var, width=25,
-            justify="center", font=("Arial", 12), state="readonly"
+            justify="center", font=("Arial", 14, "bold"), state="readonly",
+            bg="white", fg="black", readonlybackground="white",
+            relief="sunken", bd=3, highlightthickness=1, highlightbackground="black",
         )
         self.target_password_box.pack(pady=(0, 5))
 
@@ -168,7 +182,9 @@ class PasswordCrackerGUI:
         self.current_guess_var = tk.StringVar(value="None")
         self.current_guess_box = tk.Entry(
             root, textvariable=self.current_guess_var, width=25,
-            justify="center", font=("Arial", 12), state="readonly"
+            justify="center", font=("Arial", 14, "bold"), state="readonly",
+            bg="white", fg="black", readonlybackground="white",
+            relief="sunken", bd=3, highlightthickness=1, highlightbackground="black",
         )
         self.current_guess_box.pack(pady=(0, 5))
 
@@ -194,6 +210,10 @@ class PasswordCrackerGUI:
     # ------------------------------------------------------------
     # UI helpers
     # ------------------------------------------------------------
+    def toggle_fullscreen(self, event=None):
+        self.is_fullscreen = not self.is_fullscreen
+        self.root.attributes("-fullscreen", self.is_fullscreen)
+
     def update_password_label(self):
         length = self.length_var.get()
         self.password_label.config(text=f"Set {length}-digit password (numbers only)")
@@ -364,6 +384,16 @@ class PasswordCrackerGUI:
                 elif message["type"] == "worker_done":
                     self.thread_attempts[message["thread_id"]] = message["attempts"]
 
+                elif message["type"] == "error":
+                    self.output_box.insert(
+                        tk.END,
+                        f"\n[Worker {message['thread_id']} CRASHED]\n{message['error']}\n"
+                    )
+                    self.output_box.see(tk.END)
+                    self.start_button.config(state=tk.NORMAL)
+                    self.pause_button.config(state=tk.DISABLED)
+                    self.resume_button.config(state=tk.DISABLED)
+
                 elif message["type"] == "uart_status":
                     color = "red" if message.get("error") else "green"
                     self.uart_status_label.config(text=message["text"], fg=color)
@@ -445,4 +475,12 @@ def main():
 
 
 if __name__ == "__main__":
+    # Explicitly force "spawn" rather than trusting the platform default.
+    # macOS has defaulted to spawn since Python 3.8, but some installs
+    # (older interpreters, some Anaconda builds) still default to "fork".
+    # Forking a process that already has a live Tk/Cocoa GUI running is a
+    # well-known way to crash or silently kill the whole app the moment a
+    # child process is spawned — which looks exactly like "nothing happens
+    # when I hit Start." Forcing spawn here rules that out entirely.
+    multiprocessing.set_start_method("spawn", force=True)
     main()
