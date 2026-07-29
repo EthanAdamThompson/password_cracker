@@ -77,7 +77,7 @@ class PasswordCrackerGUI:
         self.length_frame = tk.Frame(root)
         self.length_frame.pack(pady=2)
         tk.Label(self.length_frame, text="Password length (numbers only):").grid(row=0, column=0, padx=5)
-        self.length_var = tk.IntVar(value=6)
+        self.length_var = tk.IntVar(value=8)
         self.length_spinbox = tk.Spinbox(
             self.length_frame, from_=1, to=10, width=5,
             textvariable=self.length_var, command=self.update_password_label
@@ -87,7 +87,7 @@ class PasswordCrackerGUI:
         # ---- Password entry ----
         # show="" (i.e. not set) means the typed password is visible in
         # plain text, not masked with asterisks.
-        self.password_label = tk.Label(root, text="Set 6-digit password (numbers only)")
+        self.password_label = tk.Label(root, text="Set 8-digit password (numbers only)")
         self.password_label.pack(pady=(8, 0))
         self.password_entry = tk.Entry(root, width=25)
         self.password_entry.pack(pady=5)
